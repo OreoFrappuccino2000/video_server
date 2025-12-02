@@ -52,21 +52,38 @@ def run(video_url: str):
         raise HTTPException(status_code=400, detail="Failed to probe video")
 
     # ---------------------------
-    # 3️⃣ Smart Phase Sampling
-    # ---------------------------
-    phases = {
-        "early": (0.05, 0.25),
-        "mid":   (0.35, 0.60),
-        "late":  (0.70, 0.90),
-        "final": (0.90, 0.98)
-    }
+# 3️⃣ Smart Phase Sampling
+# ---------------------------
+phases = {
+    "early": (0.05, 0.25),
+    "mid":   (0.35, 0.60),
+    "late":  (0.70, 0.90),
+    "final": (0.90, 0.98)
+}
 
-    frame_urls = []
+frame_urls = []
+frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
 
-    frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
+for phase, (start_r, end_r) in phases.items():
+    phase_dir = os.path.join(job_dir, phase)
+    os.makedirs(phase_dir, exist_ok=True)
 
-    for phase, (start_r, end_r) in phases.items():
-        phase_dir = os.path.join(job_dir, phase)
-        os.makedirs(phase_dir, exist_ok=True)
+    start_t = duration * start_r
+    end_t   = duration * end_r
 
-        start_t = durati_
+    interval = max((end_t - start_t) / frames_per_phase, 1)
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-ss", str(start_t), "-i", video_path,
+        "-vf", f"fps=1/{interval}",
+        "-frames:v", str(frames_per_phase),
+        f"{phase_dir}/scene_%03d.jpg"
+    ]
+
+    subprocess.run(ffmpeg_cmd, check=True)
+
+    for f in sorted(os.listdir(phase_dir)):
+        url = f"/files/{job_id}/{phase}/{f}"
+        frame_urls.append(url)
+
+frame_urls = frame_urls[:MAX_FRAMES]
