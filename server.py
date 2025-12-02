@@ -1,123 +1,157 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
 import subprocess
 import uuid
 import os
-import zipfile
 import shutil
-import time
+import requests
+import glob
 
 app = FastAPI()
 
-# ============================
-# SAFETY LIMITS (ADJUSTABLE)
-# ============================
-MAX_DURATION_SECONDS = 3600        # 1 hour max video
-FRAME_INTERVAL = 10                # 1 frame every 10 seconds
-MAX_FRAMES = 20                   # hard cap on frames
-JOB_TTL_SECONDS = 60 * 60          # auto-clean jobs older than 1 hour
-
-BASE_DIR = os.getcwd()
+MAX_TOTAL_FRAMES = 20
+SOFT_PER_PHASE = 5
 
 
-# ============================
-# HELPER: CLEANUP OLD JOBS
-# ============================
-def cleanup_old_jobs():
-    now = time.time()
-    for item in os.listdir(BASE_DIR):
-        if item.endswith(".zip"):
-            zip_path = os.path.join(BASE_DIR, item)
-            if os.path.isfile(zip_path):
-                if now - os.path.getmtime(zip_path) > JOB_TTL_SECONDS:
-                    os.remove(zip_path)
-
-        job_dir = os.path.join(BASE_DIR, item)
-        if os.path.isdir(job_dir):
-            if now - os.path.getmtime(job_dir) > JOB_TTL_SECONDS:
-                shutil.rmtree(job_dir, ignore_errors=True)
+def run(cmd):
+    subprocess.run(cmd, check=True)
 
 
-# ============================
-# MAIN PROCESSING ENDPOINT
-# ============================
 @app.post("/run")
-def run_ffmpeg(video_url: str):
-
-    cleanup_old_jobs()  # clean before starting new work
-
+def run_smart(video_url: str = Query(...)):
     job_id = str(uuid.uuid4())
-    os.makedirs(job_id, exist_ok=True)
+    work_dir = os.path.join("/tmp", job_id)
+    os.makedirs(work_dir, exist_ok=True)
 
-    # -------- 1. PROBE DURATION --------
-    probe_cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1",
-        video_url
-    ]
+    local_video = os.path.join(work_dir, "input.mp4")
 
+    # ---------------------------------------------------
+    # 1) Download video safely (works for HuggingFace)
+    # ---------------------------------------------------
     try:
+        r = requests.get(video_url, stream=True, timeout=600)
+        r.raise_for_status()
+        with open(local_video, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Video download failed: {e}")
+
+    # ---------------------------------------------------
+    # 2) Get duration
+    # ---------------------------------------------------
+    try:
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nk=1:nw=1",
+            local_video
+        ]
         duration = float(subprocess.check_output(probe_cmd).decode().strip())
     except Exception:
         raise HTTPException(status_code=400, detail="Failed to probe video")
 
-    if duration > MAX_DURATION_SECONDS:
-        shutil.rmtree(job_id, ignore_errors=True)
-        raise HTTPException(
-            status_code=413,
-            detail=f"Video too long. Max allowed is {MAX_DURATION_SECONDS} seconds."
-        )
-
-    # -------- 2. FRAME EXTRACTION --------
-    expected_frames = int(duration // FRAME_INTERVAL)
-
-    if expected_frames > MAX_FRAMES:
-        shutil.rmtree(job_id, ignore_errors=True)
-        raise HTTPException(
-            status_code=413,
-            detail=f"Too many frames ({expected_frames}). Max allowed is {MAX_FRAMES}."
-        )
-
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-i", video_url,
-        "-vf", f"fps=1/{FRAME_INTERVAL}",
-        f"{job_id}/frame_%04d.jpg"
-    ]
-
-    try:
-        subprocess.run(ffmpeg_cmd, check=True)
-    except subprocess.CalledProcessError:
-        shutil.rmtree(job_id, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="FFmpeg frame extraction failed")
-
-    # -------- 3. ZIP OUTPUT --------
-    zip_path = f"{job_id}.zip"
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for f in os.listdir(job_id):
-            zipf.write(os.path.join(job_id, f), f)
-
-    return {
-        "duration": round(duration, 3),
-        "zip_file": zip_path,
-        "download_url": f"/download/{zip_path}"
+    # ---------------------------------------------------
+    # 3) Define soft phase ranges (time only)
+    # ---------------------------------------------------
+    phases = {
+        "early": (0.00, 0.25),
+        "mid":   (0.25, 0.55),
+        "late":  (0.55, 0.85),
+        "final": (0.85, 1.00),
     }
 
+    phase_ranges = {
+        k: (v[0] * duration, v[1] * duration)
+        for k, v in phases.items()
+    }
 
-# ============================
-# PUBLIC ZIP DOWNLOAD ENDPOINT
-# ============================
-@app.get("/download/{zip_name}")
-def download_zip(zip_name: str):
+    phase_results = {}
 
-    zip_path = os.path.join(BASE_DIR, zip_name)
+    # ---------------------------------------------------
+    # 4) Scene + Motion detection per phase
+    # ---------------------------------------------------
+    for phase, (start, end) in phase_ranges.items():
+        phase_dir = os.path.join(work_dir, phase)
+        os.makedirs(phase_dir, exist_ok=True)
 
-    if not os.path.exists(zip_path):
-        raise HTTPException(status_code=404, detail="ZIP not found")
+        scene_pattern = os.path.join(phase_dir, "scene_%03d.jpg")
+        motion_pattern = os.path.join(phase_dir, "motion_%03d.jpg")
 
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=zip_name
-    )
+        try:
+            # Scene changes
+            run([
+                "ffmpeg", "-ss", str(start), "-to", str(end),
+                "-i", local_video,
+                "-vf", "select='gt(scene,0.35)'",
+                "-vsync", "vfr",
+                scene_pattern,
+                "-y"
+            ])
+
+            # Motion intensity
+            run([
+                "ffmpeg", "-ss", str(start), "-to", str(end),
+                "-i", local_video,
+                "-vf", "tblend=all_mode=difference,select='gt(scene,0.12)'",
+                "-vsync", "vfr",
+                motion_pattern,
+                "-y"
+            ])
+        except Exception:
+            pass
+
+        scene_frames = sorted(glob.glob(os.path.join(phase_dir, "scene_*.jpg")))
+        motion_frames = sorted(glob.glob(os.path.join(phase_dir, "motion_*.jpg")))
+
+        merged = scene_frames + motion_frames
+        phase_results[phase] = merged[:SOFT_PER_PHASE]
+
+    # ---------------------------------------------------
+    # 5) Merge phases with hard cap = 20
+    # ---------------------------------------------------
+    selected = []
+    seen = set()
+
+    for phase in ["early", "mid", "late", "final"]:
+        for f in phase_results.get(phase, []):
+            if f not in seen:
+                seen.add(f)
+                selected.append(f)
+
+    selected = selected[:MAX_TOTAL_FRAMES]
+
+    # ---------------------------------------------------
+    # 6) Fallback if insufficient activity
+    # ---------------------------------------------------
+    if len(selected) < 8:
+        fallback_pattern = os.path.join(work_dir, "fallback_%03d.jpg")
+        try:
+            run([
+                "ffmpeg", "-i", local_video,
+                "-vf", "fps=1/120",
+                fallback_pattern,
+                "-y"
+            ])
+            fallback_frames = sorted(glob.glob(os.path.join(work_dir, "fallback_*.jpg")))
+            for f in fallback_frames:
+                if f not in seen and len(selected) < MAX_TOTAL_FRAMES:
+                    selected.append(f)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------
+    # 7) Safety check
+    # ---------------------------------------------------
+    if not selected:
+        raise HTTPException(status_code=400, detail="No valid frames extracted")
+
+    # ---------------------------------------------------
+    # 8) Return for prepare_vlm
+    # ---------------------------------------------------
+    return {
+        "job_id": job_id,
+        "duration": duration,
+        "total_frames": len(selected),
+        "frame_paths": selected
+    }
