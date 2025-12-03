@@ -18,7 +18,7 @@ MAX_FRAMES = 20
 
 @app.post("/run")
 def run(video_url: str):
-
+    video_url = video_url.strip()
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(FILES_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
