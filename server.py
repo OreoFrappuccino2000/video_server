@@ -5,23 +5,16 @@ import uuid
 import os
 import math
 import requests
+import zipfile
 
 app = FastAPI()
 
-# ---------------------------
-# PUBLIC BASE URL (IMPORTANT)
-# ---------------------------
-BASE_URL = "https://videoserver-production.up.railway.app"
-
-# Directory for static frame hosting
 FILES_ROOT = "/app/files"
 os.makedirs(FILES_ROOT, exist_ok=True)
 
-# Serve frames publicly
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
-MAX_FRAMES = 20   # VLM limit
-
+MAX_FRAMES = 20
 
 @app.post("/run")
 def run(video_url: str):
@@ -30,35 +23,35 @@ def run(video_url: str):
     job_dir = os.path.join(FILES_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    temp_video_path = f"/tmp/{job_id}.mp4"
+    video_path = f"/tmp/{job_id}.mp4"
 
     # ---------------------------
-    # 1️⃣ Download remote MP4
+    # 1️⃣ Download Video
     # ---------------------------
     try:
-        with requests.get(video_url, stream=True, timeout=60) as r:
+        with requests.get(video_url, stream=True, timeout=120) as r:
             r.raise_for_status()
-            with open(temp_video_path, "wb") as f:
+            with open(video_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to download video")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to download video: {e}")
 
     # ---------------------------
-    # 2️⃣ Probe video duration
+    # 2️⃣ Probe Duration
     # ---------------------------
     try:
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=nk=1:nw=1",
-            temp_video_path
+            video_path
         ]).decode().strip())
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to probe video")
+    except:
+        raise HTTPException(400, "Failed to probe video")
 
     # ---------------------------
-    # 3️⃣ Smart 20-frame extraction
+    # 3️⃣ Smart Phase Sampling
     # ---------------------------
     phases = {
         "early": (0.05, 0.25),
@@ -75,12 +68,13 @@ def run(video_url: str):
         os.makedirs(phase_dir, exist_ok=True)
 
         start_t = duration * start_r
-        end_t   = duration * end_r
-
+        end_t = duration * end_r
         interval = max((end_t - start_t) / frames_per_phase, 1)
 
         ffmpeg_cmd = [
-            "ffmpeg", "-ss", str(start_t), "-i", temp_video_path,
+            "ffmpeg", "-y",
+            "-ss", str(start_t),
+            "-i", video_path,
             "-vf", f"fps=1/{interval}",
             "-frames:v", str(frames_per_phase),
             f"{phase_dir}/scene_%03d.jpg"
@@ -88,19 +82,33 @@ def run(video_url: str):
 
         subprocess.run(ffmpeg_cmd, check=True)
 
-        # ---------------------------
-        # Convert to FULL PUBLIC URLs
-        # ---------------------------
         for f in sorted(os.listdir(phase_dir)):
-            full_url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
-            frame_urls.append(full_url)
+            url = f"/files/{job_id}/{phase}/{f}"
+            frame_urls.append(url)
 
-    # Prevent overflow
     frame_urls = frame_urls[:MAX_FRAMES]
 
+    # ---------------------------
+    # 4️⃣ ZIP ALL FRAMES (CRITICAL)
+    # ---------------------------
+    zip_path = os.path.join(FILES_ROOT, f"{job_id}.zip")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, _, files in os.walk(job_dir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, job_dir)
+                zipf.write(full_path, arcname)
+
+    zip_url = f"/files/{job_id}.zip"
+
+    # ---------------------------
+    # 5️⃣ FINAL RESPONSE (DIFY SAFE)
+    # ---------------------------
     return {
         "job_id": job_id,
         "duration": duration,
         "total_frames": len(frame_urls),
-        "frame_urls": frame_urls
+        "frame_urls": frame_urls,
+        "zip_file": zip_url   # ✅ THIS is what DIFY must download
     }
