@@ -100,7 +100,8 @@ def run(video_url: str):
                 arcname = os.path.relpath(full_path, job_dir)
                 zipf.write(full_path, arcname)
 
-    zip_url = f"/files/{job_id}.zip"
+    BASE_URL = "https://videoserver-production.up.railway.app"
+    zip_url = f"{BASE_URL}/files/{job_id}.zip"
 
     # ---------------------------
     # 5️⃣ FINAL RESPONSE (DIFY SAFE)
